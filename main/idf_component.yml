@@ -1,0 +1,8 @@
+dependencies:
+  espressif/esp_video: "^1.4.0"
+  espressif/esp_cam_sensor: "^1.0.0"
+  espressif/esp_wifi_remote:
+    version: 1.2.2
+  espressif/esp_hosted:
+    version: 2.8.4
+  espressif/mdns: ^1.9.1

@@ -107,8 +107,8 @@ static const esp_cam_sensor_format_t imx219_format_1080p = {
     .name = "1080p_30fps",
     .format = ESP_CAM_SENSOR_PIXFORMAT_RAW10,
     .port = ESP_CAM_SENSOR_MIPI_CSI,
-    .width = 1920,
-    .height = 1080,
+    .width = 1536,
+    .height = 1232,
     .mipi_info = {
         .mipi_clk = 456000000, 
         .lane_num = 2,
@@ -169,6 +169,20 @@ static int imx219_del(esp_cam_sensor_device_t *dev) {
     return ESP_OK;
 }
 
+// Manually set Analog Gain (0x00-0xFF)
+esp_err_t imx219_set_gain(esp_cam_sensor_device_t *dev, uint8_t gain) {
+    if (!dev) return ESP_ERR_INVALID_ARG;
+    return imx219_write_reg(dev, 0x0157, gain);
+}
+
+// Manually set Exposure (Lines)
+esp_err_t imx219_set_exposure(esp_cam_sensor_device_t *dev, uint16_t exposure) {
+    if (!dev) return ESP_ERR_INVALID_ARG;
+    esp_err_t ret = imx219_write_reg(dev, 0x015A, (exposure >> 8) & 0xFF);
+    if (ret != ESP_OK) return ret;
+    return imx219_write_reg(dev, 0x015B, exposure & 0xFF);
+}
+
 static const esp_cam_sensor_ops_t imx219_ops = {
     .query_support_formats = imx219_query_support_formats,
     .set_format = imx219_set_format,
@@ -177,6 +191,13 @@ static const esp_cam_sensor_ops_t imx219_ops = {
     .priv_ioctl = imx219_ioctl,
     .del = imx219_del,
 };
+
+// Global reference for manual control Hack
+static esp_cam_sensor_device_t *s_imx219_dev_global = NULL;
+
+esp_cam_sensor_device_t *imx219_get_global_dev(void) {
+    return s_imx219_dev_global;
+}
 
 // Main detection function registered via macro
 ESP_CAM_SENSOR_DETECT_FN(imx219, ESP_CAM_SENSOR_MIPI_CSI, IMX219_I2C_ADDR) {
@@ -222,6 +243,8 @@ ESP_CAM_SENSOR_DETECT_FN(imx219, ESP_CAM_SENSOR_MIPI_CSI, IMX219_I2C_ADDR) {
     dev->sensor_port = ESP_CAM_SENSOR_MIPI_CSI;
     dev->sccb_handle = sccb_handle; // Important: Save the handle
     dev->cur_format = &imx219_format_1080p; // Set default format to avoid NULL issues
+
+    s_imx219_dev_global = dev; // Save for manual controls
 
     ESP_LOGI(TAG, "Device allocated at: %p", dev);
     

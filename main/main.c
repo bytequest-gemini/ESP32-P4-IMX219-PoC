@@ -33,6 +33,9 @@ static const char *TAG = "app_main";
 #define XCLK_FREQ_HZ                24000000
 
 // Wi-Fi Config
+#define IMG_WIDTH  1536
+#define IMG_HEIGHT 1232
+
 #ifdef CONFIG_ESP_WIFI_SSID
 #define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #else
@@ -154,68 +157,183 @@ esp_err_t stream_handler(httpd_req_t *req) {
     return res;
 }
 
+// Helper to access sensor device from main
+extern esp_cam_sensor_device_t *s_sensor_dev; 
+static esp_cam_sensor_device_t *s_sensor = NULL;
+
+static int s_digital_gain = 128; // 1.0x = 128
+static int s_wb_red = 140;       // ~1.1x Red Gain (Base 128)
+static int s_wb_blue = 160;      // ~1.25x Blue Gain (Base 128)
+
+// Control Handler (Port 80)
+static esp_err_t control_handler(httpd_req_t *req) {
+    char buf[100];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char val_str[10];
+        if (httpd_query_key_value(buf, "gain", val_str, sizeof(val_str)) == ESP_OK) {
+            int val = atoi(val_str);
+            if (s_sensor) imx219_set_gain(s_sensor, val);
+        }
+        if (httpd_query_key_value(buf, "exposure", val_str, sizeof(val_str)) == ESP_OK) {
+            int val = atoi(val_str);
+            if (s_sensor) imx219_set_exposure(s_sensor, val);
+        }
+        if (httpd_query_key_value(buf, "digital", val_str, sizeof(val_str)) == ESP_OK) {
+            s_digital_gain = atoi(val_str);
+        }
+        if (httpd_query_key_value(buf, "wbr", val_str, sizeof(val_str)) == ESP_OK) {
+            s_wb_red = atoi(val_str);
+        }
+        if (httpd_query_key_value(buf, "wbb", val_str, sizeof(val_str)) == ESP_OK) {
+            s_wb_blue = atoi(val_str);
+        }
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static esp_err_t index_handler(httpd_req_t *req) {
+    // Determine the stream URL. Assuming client can reach port 81 on same IP.
+    // We'll use Javascript to construct the IP:81 URL to avoid hardcoding IP.
     httpd_resp_set_type(req, "text/html");
-    const char *html = "<html><body><h1>ESP32-P4 IMX219 Color Stream</h1><img src='/stream' style='width:100%;'></body></html>";
+    const char *html = 
+        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>"
+        "body{margin:0;background:#222;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;}"
+        "img{max-width:100%;max-height:60vh;object-fit:contain;background:#000;}"
+        ".controls{padding:20px;width:90%;max-width:400px;background:#333;border-radius:10px;margin-top:10px;}"
+        "input{width:100%;margin:10px 0;}"
+        "label{display:flex;justify-content:space-between;font-size:0.9em;}"
+        "</style></head><body>"
+        "<img id='stream_img' alt='Loading Stream...'>" // src set by JS
+        "<div class='controls'>"
+        "<label>Analog Gain <span id='v_gain'>Max</span></label>"
+        "<input type='range' min='0' max='232' value='232' onchange='send(\"gain\",this.value)'>"
+        "<label>Exposure Time <span id='v_exp'>Max</span></label>"
+        "<input type='range' min='1' max='1750' value='1750' onchange='send(\"exposure\",this.value)'>"
+        "<label>Digital Brightness <span id='v_dig'>128</span></label>"
+        "<input type='range' min='0' max='255' value='128' onchange='send(\"digital\",this.value)'>"
+        "<hr>"
+        "<label>WB Red <span id='v_wbr'>140</span></label>"
+        "<input type='range' min='0' max='255' value='140' onchange='send(\"wbr\",this.value)'>"
+        "<label>WB Blue <span id='v_wbb'>160</span></label>"
+        "<input type='range' min='0' max='255' value='160' onchange='send(\"wbb\",this.value)'>"
+        "</div>"
+        "<script>"
+        "document.getElementById('stream_img').src = window.location.protocol + '//' + window.location.hostname + ':81/stream';"
+        "function send(k,v){"
+        " document.getElementById('v_'+k.substr(0,3)).innerText=v;"
+        " fetch('/control?'+k+'='+v).catch(e=>{console.log(e)});"
+        "}"
+        "</script>"
+        "</body></html>";
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
-static httpd_handle_t start_webserver(void) {
+// Start Main Control Server (Port 80)
+static httpd_handle_t start_control_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t stream_uri = {
-            .uri       = "/stream",
-            .method    = HTTP_GET,
-            .handler   = stream_handler,
-            .user_ctx  = NULL
-        };
-        httpd_register_uri_handler(server, &stream_uri);
-
-        httpd_uri_t index_uri = {
-            .uri       = "/",
-            .method    = HTTP_GET,
-            .handler   = index_handler,
-            .user_ctx  = NULL
-        };
+        httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &index_uri);
+        httpd_uri_t ctrl_uri  = { .uri = "/control", .method = HTTP_GET, .handler = control_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &ctrl_uri);
     }
     return server;
 }
 
-// Software Bayer BGGR to RGB demosaicing (2x2 block averaging)
-// Output is half resolution for speed
+// Start Stream Server (Port 81)
+static httpd_handle_t start_stream_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 81;
+    config.ctrl_port = 32769; // Must be different from default 32768
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &stream_uri);
+    }
+    return server;
+}
+
+// ... main init ...
+
+
+            // In Loop:
+
+// ...
+
+
+
+
+    // Software Bayer BGGR to RGB demosaicing for RAW10 Packed (5 bytes = 4 pixels)
+#define OUT_WIDTH 800
+#define OUT_HEIGHT 600
+
+static int *s_x_lut = NULL;
+static int *s_y_lut = NULL;
+
+static void init_demosaic_luts(int width, int height) {
+    s_x_lut = malloc(OUT_WIDTH * sizeof(int));
+    s_y_lut = malloc(OUT_HEIGHT * sizeof(int));
+    
+    for (int y = 0; y < OUT_HEIGHT; y++) {
+        s_y_lut[y] = ((y * 192) / 100) & ~1;
+    }
+    for (int x = 0; x < OUT_WIDTH; x++) {
+        s_x_lut[x] = ((x * 192) / 100) & ~1;
+    }
+}
+
 static void demosaic_bggr_to_rgb(const uint8_t *raw10, uint8_t *rgb, int width, int height)
 {
-    int out_w = width / 2;
-    int out_h = height / 2;
+    int out_w = OUT_WIDTH;
+    int out_h = OUT_HEIGHT;
     
     for (int y = 0; y < out_h; y++) {
+        int src_y = s_y_lut[y];
+        int row_offset0 = src_y * (width * 5 / 4);
+        int row_offset1 = (src_y + 1) * (width * 5 / 4);
+        
+        int out_row_idx = (out_h - 1 - y) * out_w; // Inverted Y for JPEG orientation if needed
+
         for (int x = 0; x < out_w; x++) {
-            int row0 = y * 2;
-            int row1 = y * 2 + 1;
-            int col = x * 2;
+            int src_x = s_x_lut[x];
             
-            int group = col / 4;
-            int pos_in_group = col % 4;
+            int group = src_x >> 2; // / 4
+            int pos_in_group = src_x % 4;
+            
+            int col_offset = group * 5 + pos_in_group;
             
             // RAW10 packed: 5 bytes per 4 pixels
-            int offset0 = row0 * (width * 5 / 4) + group * 5;
-            int offset1 = row1 * (width * 5 / 4) + group * 5;
-            
             // BGGR pattern
-            uint8_t b = raw10[offset0 + pos_in_group];
-            uint8_t g1 = raw10[offset0 + pos_in_group + 1];
-            uint8_t g2 = raw10[offset1 + pos_in_group];
-            uint8_t r = raw10[offset1 + pos_in_group + 1];
+            uint8_t b = raw10[row_offset0 + col_offset];
+            uint8_t g1 = raw10[row_offset0 + col_offset + 1];
+            uint8_t g2 = raw10[row_offset1 + col_offset];
+            uint8_t r = raw10[row_offset1 + col_offset + 1];
             
-            uint8_t g = (g1 + g2) / 2;
+            uint8_t g = (g1 + g2) >> 1;
+
+            // Demosaic and Apply Gain/WB
+            #define CLAMP(v) ((v) > 255 ? 255 : (v))
             
-            int out_idx = (y * out_w + x) * 3;
-            rgb[out_idx + 0] = r;
-            rgb[out_idx + 1] = g;
-            rgb[out_idx + 2] = b;
+            // Gain factors (128 = 1.0)
+            // Combine digital gain with WB
+            // r_factor = (s_digital_gain * s_wb_red) / 128
+            // g_factor = s_digital_gain
+            // b_factor = (s_digital_gain * s_wb_blue) / 128
+            
+            // To ensure 32-bit intermediate logic doesn't overflow easily:
+            uint32_t r_gain = (s_digital_gain * s_wb_red) >> 7;  
+            uint32_t g_gain = s_digital_gain;
+            uint32_t b_gain = (s_digital_gain * s_wb_blue) >> 7;
+
+            // Write RGB
+            int out_idx = (out_row_idx + (out_w - 1 - x)) * 3; // Inverted X
+            
+            rgb[out_idx + 0] = CLAMP((r * r_gain) >> 7);
+            rgb[out_idx + 1] = CLAMP((g * g_gain) >> 7);
+            rgb[out_idx + 2] = CLAMP((b * b_gain) >> 7);
         }
     }
 }
@@ -238,17 +356,23 @@ void app_main(void)
     // Init WiFi
     wifi_init_sta();
 
-    // Init JPEG Encoder (Hardware) - half resolution for color output
-    jpeg_enc_init(960, 540);
+    // ... init code ...
+    init_demosaic_luts(IMG_WIDTH, IMG_HEIGHT);
+
+    // Init JPEG Encoder (Hardware) for Color Output
+    jpeg_enc_init(OUT_WIDTH, OUT_HEIGHT);
+// ... existing init ...
 
     // Create Queue
     s_jpeg_queue = xQueueCreate(2, sizeof(jpeg_frame_t));
 
-    // Start Webserver
-    start_webserver();
+    // Start Webservers (Dual Ports)
+    start_control_server();
+    start_stream_server();
 
     // Camera Init
     enable_xclk();
+    vTaskDelay(pdMS_TO_TICKS(50)); // Wait for XCLK to stabilize sensor
     imx219_force_link();
 
     esp_video_init_csi_config_t csi_config = {
@@ -290,11 +414,11 @@ void app_main(void)
         ioctl(fd, VIDIOC_QBUF, &buf_q);
     }
 
-    // Set Format
+    // Set Format (RAW10)
     struct v4l2_format fmt = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-        .fmt.pix.width = 1920,
-        .fmt.pix.height = 1080,
+        .fmt.pix.width = IMG_WIDTH,
+        .fmt.pix.height = IMG_HEIGHT,
         .fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR10, // IMX219 Raw10
     };
     if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
@@ -304,7 +428,15 @@ void app_main(void)
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(fd, VIDIOC_STREAMON, &type);
 
-    ESP_LOGI(TAG, "Camera Started (Color Mode). Waiting for clients...");
+    ESP_LOGI(TAG, "Camera Started (RAW10 Mode). Waiting for clients...");
+    
+    // Fetch global sensor device for controls
+    s_sensor = imx219_get_global_dev();
+    if (s_sensor) {
+        ESP_LOGI(TAG, "Global Sensor Device Acquired: %p", s_sensor);
+    } else {
+        ESP_LOGE(TAG, "Global Sensor Device NOT Found!");
+    }
     
     struct v4l2_buffer buf_dq = {
         .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
@@ -323,8 +455,8 @@ void app_main(void)
     uint32_t frame_count = 0;
     uint64_t last_time = esp_timer_get_time();
 
-    // RGB buffer for demosaiced output (half resolution: 960x540x3)
-    uint8_t *rgb_buf = heap_caps_malloc(960 * 540 * 3, MALLOC_CAP_SPIRAM);
+    // RGB buffer for demosaiced output
+    uint8_t *rgb_buf = heap_caps_malloc(OUT_WIDTH * OUT_HEIGHT * 3, MALLOC_CAP_SPIRAM);
     if (!rgb_buf) ESP_LOGE(TAG, "Failed to alloc RGB buffer");
 
     while (1) {
@@ -336,11 +468,11 @@ void app_main(void)
             uint8_t *raw_data = (uint8_t*)mapped_bufs[buf_dq.index];
 
             if (rgb_buf) {
-                // Software demosaic: RAW10 BGGR -> RGB888 (half resolution)
-                demosaic_bggr_to_rgb(raw_data, rgb_buf, 1920, 1080);
+                // Optimized Software Demosaic: RAW10 -> RGB888
+                demosaic_bggr_to_rgb(raw_data, rgb_buf, IMG_WIDTH, IMG_HEIGHT);
                 
                 // Encode RGB -> JPEG
-                if (jpeg_enc_process(rgb_buf, 960 * 540 * 3, 960, 540, 
+                if (jpeg_enc_process(rgb_buf, OUT_WIDTH * OUT_HEIGHT * 3, OUT_WIDTH, OUT_HEIGHT, 
                                      V4L2_PIX_FMT_RGB24, &jpg_buf, &jpg_len) == ESP_OK) {
                     jpeg_frame_t jf = { .data = jpg_buf, .len = jpg_len };
                     if (xQueueSend(s_jpeg_queue, &jf, 0) != pdTRUE) {

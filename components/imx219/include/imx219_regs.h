@@ -8,7 +8,7 @@ typedef struct {
 } imx219_reg_t;
 
 /*
- * IMX219 1080p 30fps Settings
+ * IMX219 1640x1232 2x2 Binning Settings (Full FOV)
  * Based on 24MHz External Clock
  * 2 Lanes
  * MIPI Clock: 456 MHz (912 Mbps/lane)
@@ -40,22 +40,22 @@ static const imx219_reg_t imx219_1080p_30fps[] = {
     {0x012A, 0x18}, // EXCK_FREQ = 24MHz
     {0x012B, 0x00},
 
-    // --- Frame Timing 1080p30 ---
+    // --- Frame Timing ---
     {0x0160, 0x06}, {0x0161, 0xE3}, // Frame Length = 1763
     {0x0162, 0x0D}, {0x0163, 0x78}, // Line Length = 3448
 
-    // --- Window / Crop ---
-    {0x0164, 0x00}, {0x0165, 0x00}, // X Start
-    {0x0166, 0x0C}, {0x0167, 0xCF}, // X End (3279)
-    {0x0168, 0x00}, {0x0169, 0x00}, // Y Start
-    {0x016A, 0x09}, {0x016B, 0x9F}, // Y End (2463)
+    // --- Window / Crop (Full Sensor 3280x2464) ---
+    {0x0164, 0x00}, {0x0165, 0x00}, // X Start 0
+    {0x0166, 0x0C}, {0x0167, 0xCF}, // X End 3279
+    {0x0168, 0x00}, {0x0169, 0x00}, // Y Start 0
+    {0x016A, 0x09}, {0x016B, 0x9F}, // Y End 2463
 
-    // --- Output Size 1920x1080 ---
-    {0x016C, 0x07}, {0x016D, 0x80}, // Width 1920
-    {0x016E, 0x04}, {0x016F, 0x38}, // Height 1080
-
+    // --- Output Size 1536x1232 (Binning 2x2, Aligned 64-byte) ---
+    {0x016C, 0x06}, {0x016D, 0x00}, // Width 1536
+    {0x016E, 0x04}, {0x016F, 0xD0}, // Height 1232
+ 
     // --- Binning ---
-    {0x0174, 0x00}, {0x0175, 0x00}, // No Binning
+    {0x0174, 0x03}, {0x0175, 0x03}, // x2 Analog Binning (X/Y)
 
     // --- Data Format ---
     {0x018C, 0x0A}, // RAW10

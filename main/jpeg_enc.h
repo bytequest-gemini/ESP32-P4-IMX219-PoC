@@ -2,6 +2,7 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include "driver/jpeg_encode.h"
 
 esp_err_t jpeg_enc_init(int width, int height);
 esp_err_t jpeg_enc_process(const void *src_data, int src_size, int width, int height, 
